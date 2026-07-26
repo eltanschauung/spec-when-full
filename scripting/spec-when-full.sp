@@ -153,7 +153,11 @@ public void Event_OnPlayerDisconnect(Event event, const char[] name, bool dontBr
     int userid = event.GetInt("userid");
     waitQueue.RemoveUserIdFromQueue(userid);
     clientsInGame.RemoveUserIdFromQueue(userid);
-    // wait 1 second before running autojoin checks as at this point the client might still be in game
+    SchedulePlayerChangeChecks();
+}
+
+void SchedulePlayerChangeChecks() {
+    // Let disconnect and team-change state settle before filling the open slot.
     CreateTimer(1.0, Timer_RunPlayerCheck);
 }
 
@@ -213,7 +217,11 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
 #endif
             clientsInGame.RemoveFromQueue(client);
         }
-        RunPlayerChangeChecks();
+        if (isClientJoiningSpec) {
+            SchedulePlayerChangeChecks();
+        } else {
+            RunPlayerChangeChecks();
+        }
         return Plugin_Continue;
     }
     bool putInAutoJoin = cvarPutSpecInAutoJoin.BoolValue;
@@ -230,8 +238,7 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
             }
             PrintToChat(client, "%t", putInAutoJoin ? "SPEC_WHEN_FULL_JOIN_SPEC_AUTO" : "SPEC_WHEN_FULL_JOIN_SPEC");
         }
-        // handle when we have a full server but someone on red/blu switches to spec
-        RunPlayerChangeChecks();
+        SchedulePlayerChangeChecks();
         return Plugin_Handled;
     }
     // just in case someone typed jointeam hdfsiufhsdfi
