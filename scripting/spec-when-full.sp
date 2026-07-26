@@ -156,13 +156,20 @@ public void Event_OnPlayerDisconnect(Event event, const char[] name, bool dontBr
     SchedulePlayerChangeChecks();
 }
 
-void SchedulePlayerChangeChecks() {
+void SchedulePlayerChangeChecks(int requeueUserId = 0) {
     // Let disconnect and team-change state settle before filling the open slot.
-    CreateTimer(1.0, Timer_RunPlayerCheck);
+    CreateTimer(1.0, Timer_RunPlayerCheck, requeueUserId);
 }
 
-public Action Timer_RunPlayerCheck(Handle timer) {
+public Action Timer_RunPlayerCheck(Handle timer, any requeueUserId) {
     RunPlayerChangeChecks();
+
+    int client = GetClientOfUserId(requeueUserId);
+    if (client > 0 && IsClientInGame(client)
+        && GetClientTeam(client) == view_as<int>(TFTeam_Spectator)
+        && cvarPutSpecInAutoJoin.BoolValue && !waitQueue.InQueue(client)) {
+        waitQueue.Offer(client);
+    }
     return Plugin_Continue;
 }
 
@@ -226,19 +233,25 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
     }
     bool putInAutoJoin = cvarPutSpecInAutoJoin.BoolValue;
     bool clientInClientList = clientsInGame.InQueue(client);
+    int currentTeam = GetClientTeam(client);
+    bool clientWasPlaying = currentTeam == view_as<int>(TFTeam_Red) || currentTeam == view_as<int>(TFTeam_Blue);
     if (isClientJoiningSpec) {
 #if defined DEBUG
         LogMessage("Removing client %s (user id %d) from clientsInGame", clientName, clientUserId);
 #endif
         clientsInGame.RemoveFromQueue(client);
         ChangeClientTeam(client, TFTeam_Spectator);
-        if (IsServerFull() && !clientInClientList) {
+        int requeueUserId = 0;
+        if (clientWasPlaying && putInAutoJoin) {
+            requeueUserId = GetClientUserId(client);
+            PrintToChat(client, "%t", "SPEC_WHEN_FULL_JOIN_SPEC_AUTO");
+        } else if (IsServerFull() && !clientInClientList) {
             if (putInAutoJoin && !waitQueue.InQueue(client)) {
                 waitQueue.Offer(client);
             }
             PrintToChat(client, "%t", putInAutoJoin ? "SPEC_WHEN_FULL_JOIN_SPEC_AUTO" : "SPEC_WHEN_FULL_JOIN_SPEC");
         }
-        SchedulePlayerChangeChecks();
+        SchedulePlayerChangeChecks(requeueUserId);
         return Plugin_Handled;
     }
     // just in case someone typed jointeam hdfsiufhsdfi
