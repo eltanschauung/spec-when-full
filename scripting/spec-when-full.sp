@@ -120,8 +120,10 @@ public void OnPluginStart() {
     AddCommandListener(OnClientJoinTeam, "jointeam");
 
     HookEvent("player_disconnect", Event_OnPlayerDisconnect);
+    HookEvent("player_team", Event_OnPlayerTeam, EventHookMode_Post);
 
     AutoExecConfig();
+    RebuildClientsInGame();
 }
 
 public void OnAllPluginsLoaded() {
@@ -137,6 +139,7 @@ public void OnServerEnterHibernation() {
 }
 
 public void OnConfigsExecuted() {
+    RebuildClientsInGame();
     SetVisibleMaxPlayers();
 }
 
@@ -154,6 +157,40 @@ public void Event_OnPlayerDisconnect(Event event, const char[] name, bool dontBr
     waitQueue.RemoveUserIdFromQueue(userid);
     clientsInGame.RemoveUserIdFromQueue(userid);
     SchedulePlayerChangeChecks();
+}
+
+public void Event_OnPlayerTeam(Event event, const char[] name, bool dontBroadcast) {
+    if (event.GetBool("disconnect")) {
+        return;
+    }
+
+    int userId = event.GetInt("userid");
+    int client = GetClientOfUserId(userId);
+    if (client <= 0 || !IsClientInGame(client) || IsFakeClient(client)) {
+        return;
+    }
+
+    int oldTeam = event.GetInt("oldteam");
+    int newTeam = event.GetInt("team");
+    bool wasPlaying = IsPlayingTeam(oldTeam);
+    bool isPlaying = IsPlayingTeam(newTeam);
+
+    if (isPlaying) {
+        if (!clientsInGame.InQueue(client)) {
+            clientsInGame.Offer(client);
+        }
+        waitQueue.RemoveFromQueue(client);
+        return;
+    }
+
+    clientsInGame.RemoveFromQueue(client);
+    int requeueUserId = 0;
+    if (wasPlaying
+        && newTeam == view_as<int>(TFTeam_Spectator)
+        && cvarPutSpecInAutoJoin.BoolValue) {
+        requeueUserId = userId;
+    }
+    SchedulePlayerChangeChecks(requeueUserId);
 }
 
 void SchedulePlayerChangeChecks(int requeueUserId = 0) {
@@ -189,6 +226,9 @@ void SetVisibleMaxPlayers() {
 }
 
 public Action OnClientJoinTeam(int client, const char[] command, int argc) {
+    if (client <= 0 || !IsClientInGame(client) || IsFakeClient(client)) {
+        return Plugin_Continue;
+    }
     if (cvarMaxPlayersInGame.IntValue == -1) {
         return Plugin_Continue;
     }
@@ -401,6 +441,9 @@ void RunPlayerChangeChecks() {
 #endif
     while (!IsServerFull() && !waitQueue.IsEmpty()) {
         int client = waitQueue.Poll();
+        if (client <= 0 || !IsClientInGame(client) || IsFakeClient(client)) {
+            continue;
+        }
 #if defined DEBUG
         int clientUserId = GetClientUserId(client);
         char name[MAX_NAME_LENGTH];
@@ -412,6 +455,23 @@ void RunPlayerChangeChecks() {
         }
         FakeClientCommand(client, "jointeam " ... JOIN_TEAM_AUTO);
     }
+}
+
+void RebuildClientsInGame() {
+    clientsInGame.Clear();
+    for (int client = 1; client <= MaxClients; client++) {
+        if (!IsClientInGame(client) || IsFakeClient(client)) {
+            continue;
+        }
+
+        if (IsPlayingTeam(GetClientTeam(client))) {
+            clientsInGame.Offer(client);
+        }
+    }
+}
+
+bool IsPlayingTeam(int team) {
+    return team == view_as<int>(TFTeam_Red) || team == view_as<int>(TFTeam_Blue);
 }
 
 int GetPlayersInGame() {
