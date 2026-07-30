@@ -1,10 +1,17 @@
+#pragma semicolon 1
+#pragma newdecls required
+
 #include <sourcemod>
 #include <sdktools>
 #include <tf2>
 #include <adt_array>
+
 #undef REQUIRE_PLUGIN
 #include <afkmanager>
+#include <dgm_api>
 #define REQUIRE_PLUGIN
+
+#include <plugin_statistics>
 
 #define BASE_STR_LEN 128
 
@@ -23,6 +30,7 @@ public Plugin myinfo = {
 
 ConVar cvarMaxPlayersInGame;
 ConVar cvarPutSpecInAutoJoin;
+ConVar cvarStatisticsLogging;
 
 ConVar cvarVisibleMaxPlayers;
 ConVar cvarSourceTVEnabled;
@@ -99,6 +107,18 @@ public void OnPluginStart() {
 
     cvarMaxPlayersInGame = CreateConVar("sm_fullspec_maxplayers_in_game", "24", "Maximum amount of players allowed in game. Set to -1 to disable.");
     cvarPutSpecInAutoJoin = CreateConVar("sm_fullspec_put_spec_in_autojoin", "1", "Automatically put spectators into autojoin when server is full.");
+    cvarStatisticsLogging = CreateConVar(
+        "sm_spec_when_full_log",
+        "0",
+        "Record client and team population snapshots through kogasa-statistics.",
+        FCVAR_DONTRECORD,
+        true,
+        0.0,
+        true,
+        1.0
+    );
+
+    PluginStats_Init("spec_when_full_statistics_events");
 
     cvarVisibleMaxPlayers = FindConVar("sv_visiblemaxplayers");
     cvarSourceTVEnabled = FindConVar("tv_enable");
@@ -126,6 +146,27 @@ public void OnPluginStart() {
     RebuildClientsInGame();
 }
 
+public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errMax) {
+    MarkNativeAsOptional("DGM_GetGameModeKey");
+    MarkNativeAsOptional("DGM_NormalizeMapName");
+    MarkNativeAsOptional("DGM_CurrentNormalizedMap");
+    return APLRes_Success;
+}
+
+public void OnMapStart() {
+    PluginStats_OnMapStart();
+}
+
+public void OnClientConnected(int client) {
+    LogPopulationSnapshot("client_connected", client);
+}
+
+public void OnClientPutInServer(int client) {
+    if (!IsFakeClient(client)) {
+        LogPopulationSnapshot("client_put_in_server", client);
+    }
+}
+
 public void OnAllPluginsLoaded() {
     if (FindPluginByFile("reservedslots.smx") != INVALID_HANDLE) {
         LogMessage("Unloading reservedslots to prevent conflicts...");
@@ -144,6 +185,7 @@ public void OnConfigsExecuted() {
 }
 
 public void OnPluginEnd() {
+    PluginStats_Shutdown();
     waitQueue.Deinit();
     clientsInGame.Deinit();
 }
@@ -154,8 +196,10 @@ public void OnMaxPlayerCvarChanged(ConVar convar, const char[] oldValue, const c
 
 public void Event_OnPlayerDisconnect(Event event, const char[] name, bool dontBroadcast) {
     int userid = event.GetInt("userid");
+    int client = GetClientOfUserId(userid);
     waitQueue.RemoveUserIdFromQueue(userid);
     clientsInGame.RemoveUserIdFromQueue(userid);
+    LogPopulationSnapshot("client_disconnect", client, -1, -1, userid);
     SchedulePlayerChangeChecks();
 }
 
@@ -180,6 +224,7 @@ public void Event_OnPlayerTeam(Event event, const char[] name, bool dontBroadcas
             clientsInGame.Offer(client);
         }
         waitQueue.RemoveFromQueue(client);
+        LogPopulationSnapshot("team_change", client, oldTeam, newTeam);
         return;
     }
 
@@ -191,6 +236,69 @@ public void Event_OnPlayerTeam(Event event, const char[] name, bool dontBroadcas
         requeueUserId = userId;
     }
     SchedulePlayerChangeChecks(requeueUserId);
+    LogPopulationSnapshot("team_change", client, oldTeam, newTeam);
+}
+
+void LogPopulationSnapshot(const char[] eventName, int client = 0, int oldTeam = -1, int newTeam = -1, int userId = 0) {
+    if (cvarStatisticsLogging == null || !cvarStatisticsLogging.BoolValue) {
+        return;
+    }
+
+    int red;
+    int blue;
+    int spectator;
+    int unassigned;
+    int other;
+    GetTeamCounts(red, blue, spectator, unassigned, other);
+
+    char steamId64[32];
+    if (client > 0 && IsClientConnected(client)) {
+        if (userId == 0) {
+            userId = GetClientUserId(client);
+        }
+        if (IsClientAuthorized(client)) {
+            GetClientAuthId(client, AuthId_SteamID64, steamId64, sizeof(steamId64));
+        }
+    }
+
+    char message[512];
+    FormatEx(
+        message,
+        sizeof(message),
+        "event=%s|client=%d|userid=%d|steamid64=%s|old_team=%d|new_team=%d|playercount=%d|players_in_game=%d|red=%d|blu=%d|spectator=%d|unassigned=%d|other=%d|queue=%d|max=%d",
+        eventName,
+        client,
+        userId,
+        steamId64,
+        oldTeam,
+        newTeam,
+        GetHumanCount(),
+        GetPlayersInGame(),
+        red,
+        blue,
+        spectator,
+        unassigned,
+        other,
+        waitQueue.GetLength(),
+        cvarMaxPlayersInGame.IntValue
+    );
+    PluginStats_LogMessage(message);
+}
+
+void GetTeamCounts(int &red, int &blue, int &spectator, int &unassigned, int &other) {
+    for (int client = 1; client <= MaxClients; client++) {
+        if (!IsClientInGame(client) || IsClientSourceTV(client) || IsClientReplay(client)) {
+            continue;
+        }
+
+        switch (GetClientTeam(client)) {
+            case view_as<int>(TFTeam_Unassigned): unassigned++;
+            case view_as<int>(TFTeam_Spectator): spectator++;
+            case view_as<int>(TFTeam_Red): red++;
+            case view_as<int>(TFTeam_Blue): blue++;
+            default: other++;
+        }
+    }
 }
 
 void SchedulePlayerChangeChecks(int requeueUserId = 0) {
