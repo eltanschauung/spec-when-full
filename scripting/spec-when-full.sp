@@ -33,10 +33,11 @@ public Plugin myinfo = {
 ConVar cvarMaxPlayersInGame;
 ConVar cvarPutSpecInAutoJoin;
 ConVar cvarStatisticsLogging;
+ConVar cvarEnabled;
 
 ConVar cvarVisibleMaxPlayers;
-ConVar cvarSourceTVEnabled;
-ConVar cvarReplayEnabled;
+bool configsExecuted;
+bool capacityWarningLogged;
 
 // store userid inside as it will persist during map resets
 enum struct PlayerQueue {
@@ -109,6 +110,7 @@ public void OnPluginStart() {
 
     waitQueue.Init();
 
+    cvarEnabled = CreateConVar("sm_spec_when_full_enabled", "1", "Enable Spectate When Full.", FCVAR_DONTRECORD, true, 0.0, true, 1.0);
     cvarMaxPlayersInGame = CreateConVar("sm_fullspec_maxplayers_in_game", "24", "Maximum amount of players allowed in game. Set to -1 to disable.");
     cvarPutSpecInAutoJoin = CreateConVar("sm_fullspec_put_spec_in_autojoin", "1", "Automatically put spectators into autojoin when server is full.");
     cvarStatisticsLogging = CreateConVar(
@@ -125,9 +127,8 @@ public void OnPluginStart() {
     PluginStats_Init("spec_when_full_statistics_events");
 
     cvarVisibleMaxPlayers = FindConVar("sv_visiblemaxplayers");
-    cvarSourceTVEnabled = FindConVar("tv_enable");
-    cvarReplayEnabled = FindConVar("replay_enable");
 
+    cvarEnabled.AddChangeHook(OnEnabledCvarChanged);
     cvarMaxPlayersInGame.AddChangeHook(OnMaxPlayerCvarChanged);
     cvarVisibleMaxPlayers.AddChangeHook(OnMaxPlayerCvarChanged);
 
@@ -154,11 +155,15 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errMax)
 }
 
 public void OnMapStart() {
+    configsExecuted = false;
+    capacityWarningLogged = false;
     PluginStats_OnMapStart();
+    CancelPlayerChangeChecks();
     ClearAllPendingJoins();
 }
 
 public void OnMapEnd() {
+    configsExecuted = false;
     CancelPlayerChangeChecks();
     ClearAllPendingJoins();
 }
@@ -173,13 +178,6 @@ public void OnClientPutInServer(int client) {
     }
 }
 
-public void OnAllPluginsLoaded() {
-    if (FindPluginByFile("reservedslots.smx") != INVALID_HANDLE) {
-        LogMessage("Unloading reservedslots to prevent conflicts...");
-        ServerCommand("sm plugins unload reservedslots");
-    }
-}
-
 public void OnServerEnterHibernation() {
     CancelPlayerChangeChecks();
     waitQueue.Clear();
@@ -187,8 +185,12 @@ public void OnServerEnterHibernation() {
 }
 
 public void OnConfigsExecuted() {
-    SetVisibleMaxPlayers();
-    SchedulePlayerChangeChecks();
+    configsExecuted = true;
+    if (IsPluginEnabled()) {
+        ActivatePlugin();
+    } else {
+        DeactivatePlugin();
+    }
 }
 
 public void OnPluginEnd() {
@@ -198,10 +200,27 @@ public void OnPluginEnd() {
 }
 
 public void OnMaxPlayerCvarChanged(ConVar convar, const char[] oldValue, const char[] newValue) {
-    SetVisibleMaxPlayers();
+    if (IsPluginEnabled()) {
+        SetVisibleMaxPlayers();
+        SchedulePlayerChangeChecks();
+    }
+}
+
+public void OnEnabledCvarChanged(ConVar convar, const char[] oldValue, const char[] newValue) {
+    if (!configsExecuted) {
+        return;
+    }
+    if (IsPluginEnabled()) {
+        ActivatePlugin();
+    } else {
+        DeactivatePlugin();
+    }
 }
 
 public void Event_OnPlayerDisconnect(Event event, const char[] name, bool dontBroadcast) {
+    if (!IsPluginOperational()) {
+        return;
+    }
     int userid = event.GetInt("userid");
     int client = GetClientOfUserId(userid);
     RemoveUserIdFromWaitQueue(userid, "disconnect");
@@ -211,6 +230,9 @@ public void Event_OnPlayerDisconnect(Event event, const char[] name, bool dontBr
 }
 
 public void Event_OnPlayerTeam(Event event, const char[] name, bool dontBroadcast) {
+    if (!IsPluginOperational()) {
+        return;
+    }
     if (event.GetBool("disconnect")) {
         return;
     }
@@ -253,7 +275,7 @@ void LogPopulationSnapshot(
     int newTeam = -1,
     int userId = 0,
     const char[] reason = "") {
-    if (cvarStatisticsLogging == null || !cvarStatisticsLogging.BoolValue) {
+    if (!IsPluginEnabled() || cvarStatisticsLogging == null || !cvarStatisticsLogging.BoolValue) {
         return;
     }
 
@@ -297,7 +319,7 @@ void LogPopulationSnapshot(
         unassigned,
         other,
         waitQueue.GetLength(),
-        cvarMaxPlayersInGame.IntValue,
+        GetPlayingLimit(),
         IsServerFull() ? 1 : 0,
         reason
     );
@@ -321,7 +343,7 @@ void GetTeamCounts(int &red, int &blue, int &spectator, int &unassigned, int &ot
 }
 
 void SchedulePlayerChangeChecks() {
-    if (playerCheckTimer == null) {
+    if (IsPluginOperational() && playerCheckTimer == null) {
         playerCheckTimer = CreateTimer(RECONCILE_DELAY, Timer_RunPlayerCheck, _, TIMER_FLAG_NO_MAPCHANGE);
     }
 }
@@ -341,25 +363,31 @@ public Action Timer_RunPlayerCheck(Handle timer) {
 }
 
 void SetVisibleMaxPlayers() {
+    if (!IsPluginEnabled() || !configsExecuted || cvarVisibleMaxPlayers == null) {
+        return;
+    }
     if (cvarMaxPlayersInGame.IntValue == -1) {
-        cvarVisibleMaxPlayers.IntValue = -1;
+        if (cvarVisibleMaxPlayers.IntValue != -1) {
+            cvarVisibleMaxPlayers.IntValue = -1;
+        }
         return;
     }
     int maxHumanPlayers = GetActualMaxHumanPlayers();
-    if (maxHumanPlayers <= cvarMaxPlayersInGame.IntValue) {
-        LogError("Max human players is less than the maximum amount of players allowed in game.");
-        cvarMaxPlayersInGame.IntValue = maxHumanPlayers;
-        cvarVisibleMaxPlayers.IntValue = -1;
-        return;
+    int playingLimit = GetPlayingLimit();
+    if (maxHumanPlayers < cvarMaxPlayersInGame.IntValue && !capacityWarningLogged) {
+        LogError("Maximum players in game exceeds the engine's human-player capacity; using %d.", playingLimit);
+        capacityWarningLogged = true;
     }
-    cvarVisibleMaxPlayers.IntValue = cvarMaxPlayersInGame.IntValue;
+    if (cvarVisibleMaxPlayers.IntValue != playingLimit) {
+        cvarVisibleMaxPlayers.IntValue = playingLimit;
+    }
 }
 
 public Action OnClientJoinTeam(int client, const char[] command, int argc) {
-    if (client <= 0 || !IsClientInGame(client) || IsFakeClient(client)) {
+    if (!IsPluginOperational()) {
         return Plugin_Continue;
     }
-    if (cvarMaxPlayersInGame.IntValue == -1) {
+    if (client <= 0 || !IsClientInGame(client) || IsFakeClient(client)) {
         return Plugin_Continue;
     }
 #if defined DEBUG
@@ -368,7 +396,7 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
     GetClientName(client, clientName, sizeof(clientName));
 #endif
 
-    bool isServerOverloaded = GetHumanCount() >= cvarMaxPlayersInGame.IntValue;
+    bool isServerOverloaded = GetHumanCount() >= GetPlayingLimit();
     char team[BASE_STR_LEN];
     GetCmdArg(1, team, sizeof(team));
 
@@ -448,7 +476,7 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
 }
 
 public Action Cmd_AutoJoin(int client, int args) {
-    if (client <= 0) {
+    if (client <= 0 || !IsPluginOperational()) {
         return Plugin_Handled;
     }
     if (!IsServerFull()) {
@@ -469,7 +497,7 @@ public Action Cmd_AutoJoin(int client, int args) {
 }
 
 public Action Cmd_LeaveAutoJoin(int client, int args) {
-    if (client <= 0) {
+    if (client <= 0 || !IsPluginOperational()) {
         return Plugin_Handled;
     }
     if (GetClientTeam(client) != view_as<int>(TFTeam_Spectator)) {
@@ -486,7 +514,7 @@ public Action Cmd_LeaveAutoJoin(int client, int args) {
 }
 
 public Action Cmd_CheckAutoJoinQueue(int client, int args) {
-    if (client <= 0) {
+    if (client <= 0 || !IsPluginOperational()) {
         return Plugin_Handled;
     }
     PruneWaitQueue();
@@ -520,6 +548,9 @@ public void Menu_AutoJoinList(Menu menu, MenuAction action, int param1, int para
 }
 
 public Action OnAFKKick(int client) {
+    if (!IsPluginOperational()) {
+        return Plugin_Continue;
+    }
     if (waitQueue.InQueue(client)) {
         return Plugin_Handled;
     }
@@ -527,11 +558,17 @@ public Action OnAFKKick(int client) {
 }
 
 public void OnAFKSwitch(int client) {
+    if (!IsPluginOperational()) {
+        return;
+    }
     ClearPendingJoin(client);
     SchedulePlayerChangeChecks();
 }
 
 void RunPlayerChangeChecks() {
+    if (!IsPluginOperational()) {
+        return;
+    }
 #if defined DEBUG
     LogMessage("RunPlayerChangeChecks()");
 #endif
@@ -624,10 +661,46 @@ int GetPlayersInGame() {
 }
 
 bool IsServerFull() {
-    if (cvarMaxPlayersInGame.IntValue == -1) {
+    int playingLimit = GetPlayingLimit();
+    if (playingLimit <= 0) {
         return false;
     }
-    return GetPlayersInGame() + GetPendingJoinCount() >= cvarMaxPlayersInGame.IntValue;
+    return GetPlayersInGame() + GetPendingJoinCount() >= playingLimit;
+}
+
+bool IsPluginEnabled() {
+    return cvarEnabled != null && cvarEnabled.BoolValue;
+}
+
+bool IsPluginOperational() {
+    return configsExecuted && IsPluginEnabled() && GetPlayingLimit() > 0;
+}
+
+void ActivatePlugin() {
+    if (FindPluginByFile("reservedslots.smx") != INVALID_HANDLE) {
+        LogMessage("Unloading reservedslots to prevent conflicts...");
+        ServerCommand("sm plugins unload reservedslots");
+    }
+    SetVisibleMaxPlayers();
+    SchedulePlayerChangeChecks();
+}
+
+void DeactivatePlugin() {
+    CancelPlayerChangeChecks();
+    waitQueue.Clear();
+    ClearAllPendingJoins();
+}
+
+int GetPlayingLimit() {
+    if (cvarMaxPlayersInGame == null || cvarMaxPlayersInGame.IntValue < 0) {
+        return -1;
+    }
+    int configuredLimit = cvarMaxPlayersInGame.IntValue;
+    int maxHumanPlayers = GetActualMaxHumanPlayers();
+    if (maxHumanPlayers > 0 && configuredLimit > maxHumanPlayers) {
+        return maxHumanPlayers;
+    }
+    return configuredLimit;
 }
 
 bool HasPendingJoin(int client) {
@@ -718,20 +791,15 @@ public Action Timer_ExpirePendingJoin(Handle timer, any userId) {
 }
 
 int GetActualMaxHumanPlayers() {
-    return GetMaxHumanPlayers() - GetPlayersToDeduct();
+    return GetMaxHumanPlayers();
 }
 
 int GetHumanCount() {
-    return GetClientCount(false) - GetPlayersToDeduct();
-}
-
-int GetPlayersToDeduct() {
-    int playersToDeduct = 0;
-    if (cvarSourceTVEnabled.BoolValue) {
-        playersToDeduct++;
+    int count = 0;
+    for (int client = 1; client <= MaxClients; client++) {
+        if (IsClientConnected(client) && !IsFakeClient(client)) {
+            count++;
+        }
     }
-    if (cvarReplayEnabled.BoolValue) {
-        playersToDeduct++;
-    }
-    return playersToDeduct;
+    return count;
 }
