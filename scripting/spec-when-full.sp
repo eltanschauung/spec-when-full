@@ -204,7 +204,7 @@ public void OnMaxPlayerCvarChanged(ConVar convar, const char[] oldValue, const c
 public void Event_OnPlayerDisconnect(Event event, const char[] name, bool dontBroadcast) {
     int userid = event.GetInt("userid");
     int client = GetClientOfUserId(userid);
-    waitQueue.RemoveUserIdFromQueue(userid);
+    RemoveUserIdFromWaitQueue(userid, "disconnect");
     ClearPendingJoinByUserId(userid);
     LogPopulationSnapshot("client_disconnect", client, -1, -1, userid);
     SchedulePlayerChangeChecks();
@@ -227,8 +227,12 @@ public void Event_OnPlayerTeam(Event event, const char[] name, bool dontBroadcas
     bool isPlaying = IsPlayingTeam(newTeam);
 
     if (isPlaying) {
-        waitQueue.RemoveFromQueue(client);
+        bool promotionConfirmed = HasPendingJoin(client) && pendingJoinFromQueue[client];
+        RemoveClientFromWaitQueue(client, "joined_team");
         RequestFrame(Frame_ConfirmPendingJoin, userId);
+        if (promotionConfirmed) {
+            LogPopulationSnapshot("promotion_confirmed", client, oldTeam, newTeam, userId, "team_change");
+        }
         SchedulePlayerChangeChecks();
         LogPopulationSnapshot("team_change", client, oldTeam, newTeam);
         return;
@@ -236,13 +240,19 @@ public void Event_OnPlayerTeam(Event event, const char[] name, bool dontBroadcas
 
     ClearPendingJoin(client);
     if (wasPlaying && newTeam == view_as<int>(TFTeam_Spectator)) {
-        waitQueue.RemoveFromQueue(client);
+        RemoveClientFromWaitQueue(client, "voluntary_spectator");
     }
     SchedulePlayerChangeChecks();
     LogPopulationSnapshot("team_change", client, oldTeam, newTeam);
 }
 
-void LogPopulationSnapshot(const char[] eventName, int client = 0, int oldTeam = -1, int newTeam = -1, int userId = 0) {
+void LogPopulationSnapshot(
+    const char[] eventName,
+    int client = 0,
+    int oldTeam = -1,
+    int newTeam = -1,
+    int userId = 0,
+    const char[] reason = "") {
     if (cvarStatisticsLogging == null || !cvarStatisticsLogging.BoolValue) {
         return;
     }
@@ -265,10 +275,12 @@ void LogPopulationSnapshot(const char[] eventName, int client = 0, int oldTeam =
     }
 
     char message[512];
+    int playersInGame = GetPlayersInGame();
+    int pendingJoins = GetPendingJoinCount();
     FormatEx(
         message,
         sizeof(message),
-        "event=%s|client=%d|userid=%d|steamid64=%s|old_team=%d|new_team=%d|playercount=%d|players_in_game=%d|red=%d|blu=%d|spectator=%d|unassigned=%d|other=%d|queue=%d|max=%d",
+        "event=%s|client=%d|userid=%d|steamid64=%s|old_team=%d|new_team=%d|playercount=%d|players_in_game=%d|pending_joins=%d|effective_players=%d|red=%d|blu=%d|spectator=%d|unassigned=%d|other=%d|queue=%d|max=%d|full=%d|reason=%s",
         eventName,
         client,
         userId,
@@ -276,14 +288,18 @@ void LogPopulationSnapshot(const char[] eventName, int client = 0, int oldTeam =
         oldTeam,
         newTeam,
         GetHumanCount(),
-        GetPlayersInGame(),
+        playersInGame,
+        pendingJoins,
+        playersInGame + pendingJoins,
         red,
         blue,
         spectator,
         unassigned,
         other,
         waitQueue.GetLength(),
-        cvarMaxPlayersInGame.IntValue
+        cvarMaxPlayersInGame.IntValue,
+        IsServerFull() ? 1 : 0,
+        reason
     );
     PluginStats_LogMessage(message);
 }
@@ -320,6 +336,7 @@ void CancelPlayerChangeChecks() {
 public Action Timer_RunPlayerCheck(Handle timer) {
     playerCheckTimer = null;
     RunPlayerChangeChecks();
+    LogPopulationSnapshot("reconcile_complete", 0, -1, -1, 0, "scheduled_check");
     return Plugin_Stop;
 }
 
@@ -378,7 +395,7 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
             LogMessage("Clearing the pending join for %s (user id %d)", clientName, clientUserId);
 #endif
             ClearPendingJoin(client);
-            waitQueue.RemoveFromQueue(client);
+            RemoveClientFromWaitQueue(client, "voluntary_spectator");
         }
         if (isClientJoiningSpec) {
             SchedulePlayerChangeChecks();
@@ -394,7 +411,7 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
         LogMessage("Clearing the pending join for %s (user id %d)", clientName, clientUserId);
 #endif
         ClearPendingJoin(client);
-        waitQueue.RemoveFromQueue(client);
+        RemoveClientFromWaitQueue(client, "voluntary_spectator");
         ChangeClientTeam(client, TFTeam_Spectator);
         PrintToChat(client, "%t", "SPEC_WHEN_FULL_JOIN_SPEC");
         SchedulePlayerChangeChecks();
@@ -412,7 +429,7 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
     if (IsServerFull() && !clientAlreadyPlaying) {
         ChangeClientTeam(client, TFTeam_Spectator);
         if (putInAutoJoin && !waitQueue.InQueue(client)) {
-            waitQueue.Offer(client);
+            AddClientToWaitQueue(client, "full_join_attempt");
         }
 #if defined DEBUG
         LogMessage("Preventing client %s (user id %d) from joining the game", clientName, clientUserId);
@@ -426,7 +443,7 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
     if (!clientWasPlaying) {
         ReservePendingJoin(client, false);
     }
-    waitQueue.RemoveFromQueue(client);
+    RemoveClientFromWaitQueue(client, "joined_team");
     return Plugin_Continue;
 }
 
@@ -446,7 +463,7 @@ public Action Cmd_AutoJoin(int client, int args) {
         ReplyToCommand(client, "%t", "SPEC_WHEN_FULL_IN_QUEUE");
         return Plugin_Handled;
     }
-    waitQueue.Offer(client);
+    AddClientToWaitQueue(client, "joinqueue_command");
     ReplyToCommand(client, "%t", "SPEC_WHEN_FULL_AUTOJOIN_PLACE_QUEUE");
     return Plugin_Handled;
 }
@@ -460,7 +477,7 @@ public Action Cmd_LeaveAutoJoin(int client, int args) {
         return Plugin_Handled;
     }
     if (waitQueue.InQueue(client)) {
-        waitQueue.RemoveFromQueue(client);
+        RemoveClientFromWaitQueue(client, "leavequeue_command");
         ReplyToCommand(client, "%t", "SPEC_WHEN_FULL_AUTOJOIN_REMOVE_QUEUE");
         return Plugin_Handled;
     }
@@ -524,6 +541,7 @@ void RunPlayerChangeChecks() {
         if (!IsQueuedSpectator(client)) {
             continue;
         }
+        LogPopulationSnapshot("queue_removed", client, -1, -1, GetClientUserId(client), "promotion");
 #if defined DEBUG
         int clientUserId = GetClientUserId(client);
         char name[MAX_NAME_LENGTH];
@@ -531,6 +549,7 @@ void RunPlayerChangeChecks() {
         LogMessage("Pulling %s (user id %d) from auto join queue", name, clientUserId);
 #endif
         ReservePendingJoin(client, true);
+        LogPopulationSnapshot("promotion_requested", client, -1, -1, GetClientUserId(client), "queue_head");
         FakeClientCommand(client, "jointeam " ... JOIN_TEAM_AUTO);
         SchedulePlayerChangeChecks();
         break;
@@ -544,11 +563,39 @@ bool IsQueuedSpectator(int client) {
 
 void PruneWaitQueue() {
     for (int i = waitQueue.GetLength() - 1; i >= 0; i--) {
-        int client = GetClientOfUserId(waitQueue.clients.Get(i));
+        int userId = waitQueue.clients.Get(i);
+        int client = GetClientOfUserId(userId);
         if (!IsQueuedSpectator(client)) {
             waitQueue.clients.Erase(i);
+            LogPopulationSnapshot("queue_removed", client, -1, -1, userId, "stale_entry");
         }
     }
+}
+
+bool AddClientToWaitQueue(int client, const char[] reason) {
+    if (!IsQueuedSpectator(client) || waitQueue.InQueue(client)) {
+        return false;
+    }
+    waitQueue.Offer(client);
+    LogPopulationSnapshot("queue_added", client, -1, -1, GetClientUserId(client), reason);
+    return true;
+}
+
+bool RemoveClientFromWaitQueue(int client, const char[] reason) {
+    if (client <= 0 || !waitQueue.RemoveFromQueue(client)) {
+        return false;
+    }
+    LogPopulationSnapshot("queue_removed", client, -1, -1, GetClientUserId(client), reason);
+    return true;
+}
+
+bool RemoveUserIdFromWaitQueue(int userId, const char[] reason) {
+    if (!waitQueue.RemoveUserIdFromQueue(userId)) {
+        return false;
+    }
+    int client = GetClientOfUserId(userId);
+    LogPopulationSnapshot("queue_removed", client, -1, -1, userId, reason);
+    return true;
 }
 
 int CountPlayingHumansLocally() {
@@ -660,9 +707,10 @@ public Action Timer_ExpirePendingJoin(Handle timer, any userId) {
     int client = GetClientOfUserId(userId);
     if (client > 0 && pendingJoinUserIds[client] == userId) {
         bool requeue = pendingJoinFromQueue[client] && IsQueuedSpectator(client);
+        LogPopulationSnapshot("promotion_failed", client, -1, -1, userId, "confirmation_timeout");
         ClearPendingJoin(client);
         if (requeue) {
-            waitQueue.Offer(client);
+            AddClientToWaitQueue(client, "promotion_retry");
         }
         SchedulePlayerChangeChecks();
     }
