@@ -15,6 +15,7 @@
 
 #define BASE_STR_LEN 128
 #define JOIN_RESERVATION_TIMEOUT 3.0
+#define RECONCILE_DELAY 0.5
 
 #define JOIN_TEAM_BLU "blue"
 #define JOIN_TEAM_RED "red"
@@ -50,7 +51,9 @@ enum struct PlayerQueue {
     }
 
     void OfferViaUserId(int userId) {
-        this.clients.Push(userId);
+        if (userId > 0 && this.clients.FindValue(userId) == -1) {
+            this.clients.Push(userId);
+        }
     }
 
     void Offer(int client) {
@@ -99,6 +102,7 @@ enum struct PlayerQueue {
 PlayerQueue waitQueue;
 int pendingJoinUserIds[MAXPLAYERS + 1];
 bool pendingJoinFromQueue[MAXPLAYERS + 1];
+Handle playerCheckTimer;
 
 public void OnPluginStart() {
     LoadTranslations("spec-when-full.phrases.txt");
@@ -151,6 +155,12 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errMax)
 
 public void OnMapStart() {
     PluginStats_OnMapStart();
+    ClearAllPendingJoins();
+}
+
+public void OnMapEnd() {
+    CancelPlayerChangeChecks();
+    ClearAllPendingJoins();
 }
 
 public void OnClientConnected(int client) {
@@ -171,16 +181,19 @@ public void OnAllPluginsLoaded() {
 }
 
 public void OnServerEnterHibernation() {
+    CancelPlayerChangeChecks();
     waitQueue.Clear();
     ClearAllPendingJoins();
 }
 
 public void OnConfigsExecuted() {
     SetVisibleMaxPlayers();
+    SchedulePlayerChangeChecks();
 }
 
 public void OnPluginEnd() {
     PluginStats_Shutdown();
+    CancelPlayerChangeChecks();
     waitQueue.Deinit();
 }
 
@@ -216,18 +229,16 @@ public void Event_OnPlayerTeam(Event event, const char[] name, bool dontBroadcas
     if (isPlaying) {
         waitQueue.RemoveFromQueue(client);
         RequestFrame(Frame_ConfirmPendingJoin, userId);
+        SchedulePlayerChangeChecks();
         LogPopulationSnapshot("team_change", client, oldTeam, newTeam);
         return;
     }
 
     ClearPendingJoin(client);
-    int requeueUserId = 0;
-    if (wasPlaying
-        && newTeam == view_as<int>(TFTeam_Spectator)
-        && cvarPutSpecInAutoJoin.BoolValue) {
-        requeueUserId = userId;
+    if (wasPlaying && newTeam == view_as<int>(TFTeam_Spectator)) {
+        waitQueue.RemoveFromQueue(client);
     }
-    SchedulePlayerChangeChecks(requeueUserId);
+    SchedulePlayerChangeChecks();
     LogPopulationSnapshot("team_change", client, oldTeam, newTeam);
 }
 
@@ -293,21 +304,23 @@ void GetTeamCounts(int &red, int &blue, int &spectator, int &unassigned, int &ot
     }
 }
 
-void SchedulePlayerChangeChecks(int requeueUserId = 0) {
-    // Let disconnect and team-change state settle before filling the open slot.
-    CreateTimer(1.0, Timer_RunPlayerCheck, requeueUserId);
+void SchedulePlayerChangeChecks() {
+    if (playerCheckTimer == null) {
+        playerCheckTimer = CreateTimer(RECONCILE_DELAY, Timer_RunPlayerCheck, _, TIMER_FLAG_NO_MAPCHANGE);
+    }
 }
 
-public Action Timer_RunPlayerCheck(Handle timer, any requeueUserId) {
-    RunPlayerChangeChecks();
-
-    int client = GetClientOfUserId(requeueUserId);
-    if (client > 0 && IsClientInGame(client)
-        && GetClientTeam(client) == view_as<int>(TFTeam_Spectator)
-        && cvarPutSpecInAutoJoin.BoolValue && !waitQueue.InQueue(client)) {
-        waitQueue.Offer(client);
+void CancelPlayerChangeChecks() {
+    if (playerCheckTimer != null) {
+        delete playerCheckTimer;
+        playerCheckTimer = null;
     }
-    return Plugin_Continue;
+}
+
+public Action Timer_RunPlayerCheck(Handle timer) {
+    playerCheckTimer = null;
+    RunPlayerChangeChecks();
+    return Plugin_Stop;
 }
 
 void SetVisibleMaxPlayers() {
@@ -365,6 +378,7 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
             LogMessage("Clearing the pending join for %s (user id %d)", clientName, clientUserId);
 #endif
             ClearPendingJoin(client);
+            waitQueue.RemoveFromQueue(client);
         }
         if (isClientJoiningSpec) {
             SchedulePlayerChangeChecks();
@@ -380,18 +394,10 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
         LogMessage("Clearing the pending join for %s (user id %d)", clientName, clientUserId);
 #endif
         ClearPendingJoin(client);
+        waitQueue.RemoveFromQueue(client);
         ChangeClientTeam(client, TFTeam_Spectator);
-        int requeueUserId = 0;
-        if (clientWasPlaying && putInAutoJoin) {
-            requeueUserId = GetClientUserId(client);
-            PrintToChat(client, "%t", "SPEC_WHEN_FULL_JOIN_SPEC_AUTO");
-        } else if (IsServerFull() && !clientAlreadyPlaying) {
-            if (putInAutoJoin && !waitQueue.InQueue(client)) {
-                waitQueue.Offer(client);
-            }
-            PrintToChat(client, "%t", putInAutoJoin ? "SPEC_WHEN_FULL_JOIN_SPEC_AUTO" : "SPEC_WHEN_FULL_JOIN_SPEC");
-        }
-        SchedulePlayerChangeChecks(requeueUserId);
+        PrintToChat(client, "%t", "SPEC_WHEN_FULL_JOIN_SPEC");
+        SchedulePlayerChangeChecks();
         return Plugin_Handled;
     }
     // just in case someone typed jointeam hdfsiufhsdfi
@@ -449,10 +455,6 @@ public Action Cmd_LeaveAutoJoin(int client, int args) {
     if (client <= 0) {
         return Plugin_Handled;
     }
-    if (!IsServerFull()) {
-        ReplyToCommand(client, "%t", "SPEC_WHEN_FULL_NOT_FULL");
-        return Plugin_Handled;
-    }
     if (GetClientTeam(client) != view_as<int>(TFTeam_Spectator)) {
         ReplyToCommand(client, "%t", "SPEC_WHEN_FULL_NOT_SPEC");
         return Plugin_Handled;
@@ -470,10 +472,7 @@ public Action Cmd_CheckAutoJoinQueue(int client, int args) {
     if (client <= 0) {
         return Plugin_Handled;
     }
-    if (!IsServerFull()) {
-        ReplyToCommand(client, "%t", "SPEC_WHEN_FULL_NOT_FULL");
-        return Plugin_Handled;
-    }
+    PruneWaitQueue();
     if (waitQueue.IsEmpty()) {
         ReplyToCommand(client, "%t", "SPEC_WHEN_FULL_AUTOJOIN_EMPTY");
         return Plugin_Handled;
@@ -486,6 +485,9 @@ public Action Cmd_CheckAutoJoinQueue(int client, int args) {
     menu.ExitButton = true;
     for (int i = 0; i < waitQueue.GetLength(); i++) {
         int specClientIndex = GetClientOfUserId(waitQueue.clients.Get(i));
+        if (!IsQueuedSpectator(specClientIndex)) {
+            continue;
+        }
         char clientName[MAX_NAME_LENGTH];
         GetClientName(specClientIndex, clientName, sizeof(clientName));
         menu.AddItem(clientName, clientName, ITEMDRAW_DISABLED);
@@ -509,16 +511,17 @@ public Action OnAFKKick(int client) {
 
 public void OnAFKSwitch(int client) {
     ClearPendingJoin(client);
-    RunPlayerChangeChecks();
+    SchedulePlayerChangeChecks();
 }
 
 void RunPlayerChangeChecks() {
 #if defined DEBUG
     LogMessage("RunPlayerChangeChecks()");
 #endif
+    PruneWaitQueue();
     while (!IsServerFull() && !waitQueue.IsEmpty()) {
         int client = waitQueue.Poll();
-        if (client <= 0 || !IsClientInGame(client) || IsFakeClient(client)) {
+        if (!IsQueuedSpectator(client)) {
             continue;
         }
 #if defined DEBUG
@@ -529,6 +532,22 @@ void RunPlayerChangeChecks() {
 #endif
         ReservePendingJoin(client, true);
         FakeClientCommand(client, "jointeam " ... JOIN_TEAM_AUTO);
+        SchedulePlayerChangeChecks();
+        break;
+    }
+}
+
+bool IsQueuedSpectator(int client) {
+    return client > 0 && IsClientInGame(client) && !IsFakeClient(client)
+        && GetClientTeam(client) == view_as<int>(TFTeam_Spectator);
+}
+
+void PruneWaitQueue() {
+    for (int i = waitQueue.GetLength() - 1; i >= 0; i--) {
+        int client = GetClientOfUserId(waitQueue.clients.Get(i));
+        if (!IsQueuedSpectator(client)) {
+            waitQueue.clients.Erase(i);
+        }
     }
 }
 
@@ -633,13 +652,18 @@ public void Frame_ConfirmPendingJoin(any userId) {
     int client = GetClientOfUserId(userId);
     if (client > 0 && IsClientInGame(client) && IsPlayingTeam(GetClientTeam(client))) {
         ClearPendingJoin(client);
+        SchedulePlayerChangeChecks();
     }
 }
 
 public Action Timer_ExpirePendingJoin(Handle timer, any userId) {
     int client = GetClientOfUserId(userId);
     if (client > 0 && pendingJoinUserIds[client] == userId) {
+        bool requeue = pendingJoinFromQueue[client] && IsQueuedSpectator(client);
         ClearPendingJoin(client);
+        if (requeue) {
+            waitQueue.Offer(client);
+        }
         SchedulePlayerChangeChecks();
     }
     return Plugin_Stop;
