@@ -11,7 +11,7 @@
 #include <dgm_api>
 #define REQUIRE_PLUGIN
 
-#include <plugin_statistics>
+#include <statistics>
 
 #define BASE_STR_LEN 128
 #define JOIN_RESERVATION_TIMEOUT 3.0
@@ -117,7 +117,7 @@ public void OnPluginStart() {
     cvarStatisticsLogging = CreateConVar(
         "sm_spec_when_full_log",
         "0",
-        "Record client and team population snapshots through kogasa-statistics.",
+        "Record client and team population snapshots through the plugin statistics service.",
         FCVAR_DONTRECORD,
         true,
         0.0,
