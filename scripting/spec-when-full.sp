@@ -11,7 +11,7 @@
 #include <dgm_api>
 #define REQUIRE_PLUGIN
 
-#include <statistics>
+#include <plugin_statistics>
 
 #define BASE_STR_LEN 128
 #define JOIN_RESERVATION_TIMEOUT 3.0
@@ -125,8 +125,6 @@ public void OnPluginStart() {
         1.0
     );
 
-    PluginStats_Init("spec_when_full_statistics_events");
-
     cvarVisibleMaxPlayers = FindConVar("sv_visiblemaxplayers");
 
     cvarEnabled.AddChangeHook(OnEnabledCvarChanged);
@@ -158,7 +156,6 @@ public APLRes AskPluginLoad2(Handle myself, bool late, char[] error, int errMax)
 public void OnMapStart() {
     configsExecuted = false;
     capacityWarningLogged = false;
-    PluginStats_OnMapStart();
     CancelPlayerChangeChecks();
     ClearAllPendingJoins();
 }
@@ -195,7 +192,6 @@ public void OnConfigsExecuted() {
 }
 
 public void OnPluginEnd() {
-    PluginStats_Shutdown();
     CancelPlayerChangeChecks();
     waitQueue.Deinit();
 }
@@ -328,7 +324,7 @@ void LogPopulationSnapshot(
         IsServerFull() ? 1 : 0,
         reason
     );
-    PluginStats_LogMessage(message);
+    PluginStats_Record(eventName, message);
 }
 
 void GetTeamCounts(int &red, int &blue, int &spectator, int &unassigned, int &other) {
