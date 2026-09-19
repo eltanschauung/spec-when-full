@@ -249,6 +249,9 @@ public void Event_OnPlayerTeam(Event event, const char[] name, bool dontBroadcas
         bool promotionConfirmed = HasPendingJoin(client) && pendingJoinFromQueue[client];
         RemoveClientFromWaitQueue(client, "joined_team");
         RequestFrame(Frame_ConfirmPendingJoin, userId);
+        if (!wasPlaying) {
+            RequestFrame(Frame_EnforcePlayingCapacity, userId);
+        }
         if (promotionConfirmed) {
             LogPopulationSnapshot("promotion_confirmed", client, oldTeam, newTeam, userId, "team_change");
         }
@@ -397,7 +400,6 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
     GetClientName(client, clientName, sizeof(clientName));
 #endif
 
-    bool isServerOverloaded = GetHumanCount() >= GetPlayingLimit();
     char team[BASE_STR_LEN];
     GetCmdArg(1, team, sizeof(team));
 
@@ -405,37 +407,12 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
     LogMessage("Client %s (user id %d) issued \"jointeam %s\"", clientName, clientUserId, team);
 #endif
 
-    bool isClientJoiningGame = StrEqual(team, JOIN_TEAM_AUTO, false) || StrEqual(team, JOIN_TEAM_BLU, false) || StrEqual(team, JOIN_TEAM_RED, false);
-    bool isClientJoiningSpec = StrEqual(team, JOIN_TEAM_SPECTATOR, false);
+    bool isClientJoiningGame = IsPlayingTeamRequest(team);
+    bool isClientJoiningSpec = IsSpectatorTeamRequest(team);
     int requestedTeam = GetRequestedJoinTeam(team);
     int currentTeam = GetClientTeam(client);
     bool clientWasPlaying = IsPlayingTeam(currentTeam);
-    if (!isServerOverloaded) {
-#if defined DEBUG
-        LogMessage("Server is not overloaded right now");
-#endif
-        if (isClientJoiningGame && !clientWasPlaying) {
-#if defined DEBUG
-            LogMessage("Reserving a pending join for %s (user id %d)", clientName, clientUserId);
-#endif
-            ReservePendingJoin(client, false, requestedTeam);
-        }
-        if (isClientJoiningSpec) {
-#if defined DEBUG
-            LogMessage("Clearing the pending join for %s (user id %d)", clientName, clientUserId);
-#endif
-            ClearPendingJoin(client);
-            RemoveClientFromWaitQueue(client, "voluntary_spectator");
-        }
-        if (isClientJoiningSpec) {
-            SchedulePlayerChangeChecks();
-        } else {
-            RunPlayerChangeChecks();
-        }
-        return Plugin_Continue;
-    }
     bool putInAutoJoin = cvarPutSpecInAutoJoin.BoolValue;
-    bool clientAlreadyPlaying = clientWasPlaying || HasPendingJoin(client);
     if (isClientJoiningSpec) {
 #if defined DEBUG
         LogMessage("Clearing the pending join for %s (user id %d)", clientName, clientUserId);
@@ -451,13 +428,19 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
     if (!isClientJoiningGame) {
         return Plugin_Continue;
     }
+    if (clientWasPlaying) {
+        ClearPendingJoin(client);
+        RemoveClientFromWaitQueue(client, "joined_team");
+        SchedulePlayerChangeChecks();
+        return Plugin_Continue;
+    }
 #if defined DEBUG
-    LogMessage("Client %s (user id %d) is already playing or reserved: %s", clientName, clientUserId, clientAlreadyPlaying ? "true" : "false");
+    LogMessage("Client %s (user id %d) already has a reservation: %s", clientName, clientUserId, HasPendingJoin(client) ? "true" : "false");
     LogMessage("Effective players: %d", GetPlayersInGame() + GetPendingJoinCount());
     LogMessage("IsServerFull: %s", IsServerFull() ? "true" : "false");
 #endif
-    if (IsServerFull() && !clientAlreadyPlaying) {
-        LogPopulationSnapshot("join_blocked", client, currentTeam, requestedTeam, GetClientUserId(client), "both_teams_reserved_or_full");
+    if (!ReservePendingJoin(client, false, requestedTeam)) {
+        LogPopulationSnapshot("join_blocked", client, currentTeam, requestedTeam, GetClientUserId(client), "capacity_or_team_unavailable");
         ChangeClientTeam(client, TFTeam_Spectator);
         if (putInAutoJoin && !waitQueue.InQueue(client)) {
             AddClientToWaitQueue(client, "full_join_attempt");
@@ -466,16 +449,14 @@ public Action OnClientJoinTeam(int client, const char[] command, int argc) {
         LogMessage("Preventing client %s (user id %d) from joining the game", clientName, clientUserId);
 #endif
         PrintToChat(client, "%t", putInAutoJoin ? "SPEC_WHEN_FULL_JOIN_SPEC_AUTO" : "SPEC_WHEN_FULL_JOIN_SPEC");
+        SchedulePlayerChangeChecks();
         return Plugin_Handled;
     }
 #if defined DEBUG
-    LogMessage("Reserving a pending join for %s (user id %d)", clientName, clientUserId);
+    LogMessage("Reserved a pending join for %s (user id %d)", clientName, clientUserId);
 #endif
-    if (!clientWasPlaying) {
-        ReservePendingJoin(client, false, requestedTeam);
-    }
     RemoveClientFromWaitQueue(client, "joined_team");
-    LogPopulationSnapshot("join_allowed", client, currentTeam, requestedTeam, GetClientUserId(client), "team_slot_available");
+    LogPopulationSnapshot("join_allowed", client, currentTeam, requestedTeam, GetClientUserId(client), "capacity_reserved");
     return Plugin_Continue;
 }
 
@@ -589,7 +570,10 @@ void RunPlayerChangeChecks() {
         GetClientName(client, name, sizeof(name));
         LogMessage("Pulling %s (user id %d) from auto join queue", name, clientUserId);
 #endif
-        ReservePendingJoin(client, true, 0);
+        if (!ReservePendingJoin(client, true, 0)) {
+            AddClientToWaitQueue(client, "promotion_no_slot");
+            break;
+        }
         LogPopulationSnapshot("promotion_requested", client, -1, -1, GetClientUserId(client), "queue_head");
         FakeClientCommand(client, "jointeam " ... JOIN_TEAM_AUTO);
         SchedulePlayerChangeChecks();
@@ -670,12 +654,7 @@ bool IsServerFull() {
         return false;
     }
 
-    int redLimit = playingLimit / 2;
-    int blueLimit = playingLimit - redLimit;
-    int redPlayers = CountPlayingHumansOnTeam(view_as<int>(TFTeam_Red));
-    int bluePlayers = CountPlayingHumansOnTeam(view_as<int>(TFTeam_Blue));
-    return redPlayers + GetPendingJoinCountForTeam(view_as<int>(TFTeam_Red)) >= redLimit
-        && bluePlayers + GetPendingJoinCountForTeam(view_as<int>(TFTeam_Blue)) >= blueLimit;
+    return CountPlayingHumansLocally() + GetPendingJoinCount() >= playingLimit;
 }
 
 bool IsPluginEnabled() {
@@ -718,26 +697,33 @@ bool HasPendingJoin(int client) {
         && pendingJoinUserIds[client] == GetClientUserId(client);
 }
 
-void ReservePendingJoin(int client, bool fromQueue, int requestedTeam) {
+bool ReservePendingJoin(int client, bool fromQueue, int requestedTeam) {
     if (client <= 0 || !IsClientInGame(client) || IsFakeClient(client) || IsPlayingTeam(GetClientTeam(client))) {
-        return;
+        return false;
     }
 
     if (HasPendingJoin(client)) {
-        pendingJoinFromQueue[client] = pendingJoinFromQueue[client] || fromQueue;
-        return;
+        if (requestedTeam == 0 || pendingJoinTeams[client] == requestedTeam) {
+            pendingJoinFromQueue[client] = pendingJoinFromQueue[client] || fromQueue;
+            return true;
+        }
+        ClearPendingJoin(client);
+    }
+    if (IsServerFull()) {
+        return false;
     }
 
     int userId = GetClientUserId(client);
     int reservedTeam = SelectPendingJoinTeam(requestedTeam);
     if (!IsPlayingTeam(reservedTeam)) {
-        return;
+        return false;
     }
 
     pendingJoinUserIds[client] = userId;
     pendingJoinTeams[client] = reservedTeam;
     pendingJoinFromQueue[client] = fromQueue;
     CreateTimer(JOIN_RESERVATION_TIMEOUT, Timer_ExpirePendingJoin, userId, TIMER_FLAG_NO_MAPCHANGE);
+    return true;
 }
 
 void ClearPendingJoin(int client) {
@@ -803,13 +789,25 @@ int GetPendingJoinCountForTeam(int team) {
 }
 
 int GetRequestedJoinTeam(const char[] team) {
-    if (StrEqual(team, JOIN_TEAM_RED, false)) {
+    if (StrEqual(team, JOIN_TEAM_RED, false) || StrEqual(team, "2")) {
         return view_as<int>(TFTeam_Red);
     }
-    if (StrEqual(team, JOIN_TEAM_BLU, false)) {
+    if (StrEqual(team, JOIN_TEAM_BLU, false) || StrEqual(team, "blu", false) || StrEqual(team, "3")) {
         return view_as<int>(TFTeam_Blue);
     }
     return 0;
+}
+
+bool IsPlayingTeamRequest(const char[] team) {
+    return StrEqual(team, JOIN_TEAM_AUTO, false)
+        || StrEqual(team, "0")
+        || GetRequestedJoinTeam(team) != 0;
+}
+
+bool IsSpectatorTeamRequest(const char[] team) {
+    return StrEqual(team, JOIN_TEAM_SPECTATOR, false)
+        || StrEqual(team, "spectator", false)
+        || StrEqual(team, "1");
 }
 
 int SelectPendingJoinTeam(int requestedTeam) {
@@ -849,6 +847,31 @@ public void Frame_ConfirmPendingJoin(any userId) {
         ClearPendingJoin(client);
         SchedulePlayerChangeChecks();
     }
+}
+
+public void Frame_EnforcePlayingCapacity(any userId) {
+    if (!IsPluginOperational()) {
+        return;
+    }
+
+    int client = GetClientOfUserId(userId);
+    if (client <= 0 || !IsClientInGame(client) || IsFakeClient(client)
+        || !IsPlayingTeam(GetClientTeam(client))
+        || CountPlayingHumansLocally() <= GetPlayingLimit()) {
+        return;
+    }
+
+    int oldTeam = GetClientTeam(client);
+    LogPopulationSnapshot("overflow_corrected", client, oldTeam, view_as<int>(TFTeam_Spectator), userId, "post_team_change");
+    ClearPendingJoin(client);
+    ChangeClientTeam(client, TFTeam_Spectator);
+
+    bool putInAutoJoin = cvarPutSpecInAutoJoin.BoolValue;
+    if (putInAutoJoin) {
+        AddClientToWaitQueue(client, "overflow_corrected");
+    }
+    PrintToChat(client, "%t", putInAutoJoin ? "SPEC_WHEN_FULL_JOIN_SPEC_AUTO" : "SPEC_WHEN_FULL_JOIN_SPEC");
+    SchedulePlayerChangeChecks();
 }
 
 public Action Timer_ExpirePendingJoin(Handle timer, any userId) {
